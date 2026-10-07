@@ -1,0 +1,23 @@
+# Environment / secrets
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Large face-recognition model files
+face_recognition_models-master/
+models.zip
