@@ -21,3 +21,7 @@ dist/
 # Large face-recognition model files
 face_recognition_models-master/
 models.zip
+# Frontend generated files
+frontend/.env.local
+frontend/node_modules/
+frontend/.next/
