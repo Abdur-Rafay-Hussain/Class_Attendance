@@ -58,10 +58,9 @@ class Student(Base):
     __tablename__ = "student"
 
     id = Column(
-        Integer,
+        String(50),
         primary_key=True,
-        index=True,
-        autoincrement=True
+        index=True
     )
 
     name = Column(
@@ -205,7 +204,7 @@ class Enrollment(Base):
     )
 
     student_id = Column(
-        Integer,
+        String(50),
         ForeignKey("student.id"),
         nullable=False
     )
@@ -307,7 +306,7 @@ class Attendance(Base):
     )
 
     student_id = Column(
-        Integer,
+        String(50),
         ForeignKey("student.id"),
         nullable=False
     )

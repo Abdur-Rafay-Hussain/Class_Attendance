@@ -18,3 +18,7 @@ class Session(BaseModel):
     course_id: int
     session_uid: str
     status: str
+class TeacherSignupRequest(BaseModel):
+    teacher: Teacher
+    course: Course
+    secret_key: str

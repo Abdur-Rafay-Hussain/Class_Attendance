@@ -28,21 +28,6 @@ def create_access_token(data: dict):
         )
     return encoded_jwt
 
-# def verify_token(token = Depends(auth)):
-#     try:
-#         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-#         if not payload:
-#             raise HTTPException(
-#                 status_code=status.HTTP_401_UNAUTHORIZED,
-#                 detail="Could not validate credentials",
-#             )
-#         return payload
-#     except JWTError:
-#         raise HTTPException(
-#             status_code=status.HTTP_401_UNAUTHORIZED,
-#             detail="Could not validate credentials",
-#         )
-
 def verify_token(token=Depends(auth)):
     try:
         # print("TOKEN:", token)

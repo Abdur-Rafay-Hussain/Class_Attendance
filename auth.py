@@ -7,13 +7,13 @@ def get_current_user(token: str = Depends(verify_token)):
     db = SessionLocal()
 
     try:
-        user_id = int(token["sub"])
+        user_id = token["sub"]
         role = token["role"]
 
         if role == "teacher":
 
             teacher = db.query(Teachers).filter(
-                Teachers.id == user_id
+                Teachers.id == int(user_id)
             ).first()
 
             if not teacher:

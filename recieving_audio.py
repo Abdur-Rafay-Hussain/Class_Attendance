@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import os
 from fastapi import HTTPException, status
+from scipy.signal import butter, sosfiltfilt
 
 FACE_MATCH_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD"))
 
@@ -16,6 +17,26 @@ MAX_AUDIO_SIZE = 5 * 1024 * 1024
 
 MAX_IMAGE_SIZE = 5 * 1024 * 1024
 
+
+
+def apply_high_pass_filter(audio: np.ndarray) -> np.ndarray:
+    # Keep the original audio samples in floating-point format.
+    audio = audio.astype(np.float64)
+
+    # Design a high-pass filter with a 16 kHz cutoff.
+    sos = butter(
+        4,
+        3000,
+        btype="highpass",
+        fs=SAMPLE_RATE,
+        output="sos",
+    )
+
+    # Remove frequencies below the cutoff.
+    filtered_audio = sosfiltfilt(sos, audio)
+
+    # Return the filtered audio samples.
+    return filtered_audio
 
 # Define a function to find the strongest frequency in an audio segment.
 def get_dominant_frequency(audio_chunk: np.ndarray) -> float:
@@ -115,7 +136,8 @@ def decode_audio(wav_bytes: bytes) -> str:
             status_code=400,
             detail="Audio is empty.",
         )
-
+    # Reduce low-frequency background noise.
+    audio = apply_high_pass_filter(audio)
     # Calculate the number of samples in a 50-millisecond frame.
     frame_size = int(SAMPLE_RATE * 0.05)
 

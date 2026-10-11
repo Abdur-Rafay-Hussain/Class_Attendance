@@ -39,7 +39,10 @@ from recieving_audio import (
 )
 
 import numpy as np
+from pathlib import Path
 
+AUDIO_DIR = Path("uploads")
+AUDIO_DIR.mkdir(exist_ok=True)
 
 # ============================================================
 # ROUTER
@@ -438,7 +441,9 @@ def start_attendance(
         wav_bytes = convert_to_wav(
             audio
         )
-
+        audio_path = AUDIO_DIR / f"attendance_{session_uid}.wav"
+        with open(audio_path, "wb") as f:
+            f.write(wav_bytes)
     except Exception:
 
         session.status = "failed"
@@ -503,11 +508,11 @@ def get_attendance_audio(
     # --------------------------------------------------------
 
     now = datetime.now(timezone.utc)
-
-    if now >= session.expires_at:
-
+    expires_at = session.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if now >= expires_at:
         session.status = "expired"
-
         db.commit()
 
         # Mark students who never attended as absent.
@@ -720,21 +725,23 @@ async def mark_attendance(
     # --------------------------------------------------------
 
     now = datetime.now(timezone.utc)
-
-    session = (
-        db.query(Sessions)
-        .filter(
-            Sessions.session_uid == str(
-                session_uid
-            ),
-            Sessions.status == "active",
-            Sessions.expires_at > now,
-        )
-        .first()
+    active_sessions = (
+    db.query(Sessions)
+    .filter(
+        Sessions.session_uid == str(session_uid),
+        Sessions.status == "active",
     )
-
+    .all()
+)
+    session = None
+    for candidate in active_sessions:
+        expires_at = candidate.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if now < expires_at:
+            session = candidate
+            break
     if not session:
-
         raise HTTPException(
             status_code=400,
             detail="Invalid or expired attendance session.",
@@ -824,17 +831,10 @@ async def mark_attendance(
     )
 
     if existing_attendance:
-
         return {
-            "session_id": session_uid,
-            "face_matched": (
-                existing_attendance.status
-                == "PRESENT"
-            ),
-            "status": existing_attendance.status,
-            "reason": existing_attendance.reason,
-            "message": "Attendance already processed.",
-        }
+    "status": existing_attendance.status,
+    "message": "Attendance already processed.",
+}
 
     # --------------------------------------------------------
     # 15. Face verification
@@ -869,7 +869,6 @@ async def mark_attendance(
         ),
         "verified_at": now.isoformat(),
     }
-
     # --------------------------------------------------------
     # 17. Send hard facts to agent
     # --------------------------------------------------------
@@ -988,10 +987,13 @@ def attendance_status(
 
     now = datetime.now(timezone.utc)
 
+    expires_at = session.expires_at
+
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
     if (
-        session.status == "active"
-        and now >= session.expires_at
-    ):
+    session.status == "active" and now >= expires_at):
 
         session.status = "expired"
 
