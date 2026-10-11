@@ -25,3 +25,30 @@ models.zip
 frontend/.env.local
 frontend/node_modules/
 frontend/.next/
+
+# Ignore private and generated files
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+.venv/
+venv/
+ENV/
+**/node_modules/
+**/.next/
+
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+ENV/
+**/node_modules/
+**/.next/
+
+# Ignore audio recordings and local headers
+*.wav
+uploads/
+headers.txt
