@@ -10,8 +10,8 @@ MARKER_FREQUENCY = 4800    # Frontend ki 5000Hz limit ke andar safe marker
 DIGIT_DURATION = 0.35      
 MARKER_DURATION = 0.15     # Perfect 0.15s duration
 GAP_DURATION = 0.5         # Goonj (echo) khatam karne ke liye silence gap
-REPEAT_COUNT = 80
-SESSION_DURATION = 10
+REPEAT_COUNT = 8
+SESSION_DURATION = 2
 AMPLITUDE = 0.9
 
 def generate_tone(frequency: float, duration: float) -> np.ndarray:

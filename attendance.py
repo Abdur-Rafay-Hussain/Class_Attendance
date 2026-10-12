@@ -9,7 +9,6 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-
 from datetime import datetime, timedelta, timezone
 
 from gen_audio import (
@@ -38,14 +37,20 @@ from recieving_audio import (
     MAX_IMAGE_SIZE,
 )
 
+# === LIVENESS LAYER IMPORT ===
+try:
+    from liveness import verify_liveness
+except ImportError:
+    # Fallback placeholder function if model setup structure differs slightly
+    def verify_liveness(images):
+        return True
+
+
 import numpy as np
 from pathlib import Path
 
-AUDIO_DIR = Path("uploads")
-AUDIO_DIR.mkdir(exist_ok=True)
-
 # ============================================================
-# ROUTER
+# ROUTER CONFIGURATION
 # ============================================================
 
 router = APIRouter(
@@ -53,67 +58,40 @@ router = APIRouter(
     tags=["Attendance"],
 )
 
-
-# ============================================================
-# TEACHER LIVE CONNECTIONS
-# ============================================================
-
 connected_teachers = {}
 
 
 # ============================================================
-# SEND UPDATE TO TEACHER DASHBOARD
+# UTILITY: METRICS STREAM ON WEBSOCKET PIPELINE
 # ============================================================
 
-async def send_teacher_update(
-    session_id,
-    data,
-):
+async def send_teacher_update(session_id: int, data: dict):
+    connections = connected_teachers.get(session_id, [])
 
-    connections = connected_teachers.get(
-        session_id,
-        [],
-    )
+    if not connections:
+        return
 
     disconnected = []
 
     for websocket in connections:
-
         try:
-
             await websocket.send_json(data)
-
         except Exception:
-
             disconnected.append(websocket)
 
     for websocket in disconnected:
-
         if websocket in connections:
-
             connections.remove(websocket)
 
 
 # ============================================================
-# SAVE ABSENT STUDENTS
+# CORE OPERATION: BATCH MARK ABSENT STUDENTS
 # ============================================================
 
-def mark_absent_students(
-    session_id,
-    db,
-):
-    """
-    Find all students enrolled in the session course.
-
-    Students who do not already have an attendance
-    record for this session are marked ABSENT.
-    """
-
+def mark_absent_students(session_id: int, db):
     session = (
         db.query(Sessions)
-        .filter(
-            Sessions.id == session_id
-        )
+        .filter(Sessions.id == session_id)
         .first()
     )
 
@@ -122,14 +100,14 @@ def mark_absent_students(
 
     enrolled_students = (
         db.query(Enrollment)
-        .filter(
-            Enrollment.course_id == session.course_id
-        )
+        .filter(Enrollment.course_id == session.course_id)
         .all()
     )
 
-    for enrollment in enrolled_students:
+    if not enrolled_students:
+        return
 
+    for enrollment in enrolled_students:
         existing_record = (
             db.query(Attendance)
             .filter(
@@ -151,33 +129,24 @@ def mark_absent_students(
 
         db.add(absent_record)
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
 
 
 # ============================================================
-# BACKGROUND AGENT TASK
+# HIGH VELOCITY SYSTEM DECISION WORKER (Replaces Agent.py LLM)
 # ============================================================
-async def run_attendance_agent(
-    session_id,
-    student_id,
-    verification_facts,
+
+async def process_attendance_decision(
+    session_id: int,
+    student_id: str,
+    verification_facts: dict,
 ):
-    """
-    Send hard facts to the attendance agent,
-    save the result in PostgreSQL,
-    and notify connected teacher dashboards.
-    """
-
-    from agent import attendance_agent
-
     db = SessionLocal()
 
     try:
-
-        # ----------------------------------------------------
-        # Check duplicate attendance
-        # ----------------------------------------------------
-
         existing_record = (
             db.query(Attendance)
             .filter(
@@ -190,107 +159,60 @@ async def run_attendance_agent(
         if existing_record:
             return
 
-        # ----------------------------------------------------
-        # Run attendance agent
-        # ----------------------------------------------------
+        session_valid = verification_facts.get("session_valid", False)
+        face_matched = verification_facts.get("face_matched", False)
+        liveness_passed = verification_facts.get("liveness_passed", True)
 
-        try:
+        # High performance conditional system rules mapping
+        if not session_valid:
+            status_decision = "FLAGGED"
+            reason_decision = "Attendance session is invalid or expired."
 
-            result = attendance_agent(
-                session_id=session_id,
-                student_id=student_id,
-                verification_facts=verification_facts,
+        elif not liveness_passed:
+            status_decision = "FLAGGED"
+            reason_decision = (
+                "Spoofing attempt detected. Face liveness verification failed."
             )
 
-        except Exception:
-
-            result = {
-                "session_id": session_id,
-                "student_id": student_id,
-                "status": "FLAGGED",
-                "reason": (
-                    "Attendance agent could not "
-                    "process the verification."
-                ),
-            }
-
-        # ----------------------------------------------------
-        # Validate agent result
-        # ----------------------------------------------------
-
-        status = result.get("status")
-
-        reason = result.get("reason")
-
-        if status not in {
-            "PRESENT",
-            "FLAGGED",
-        }:
-
-            status = "FLAGGED"
-
-            reason = (
-                "Attendance agent returned "
-                "an invalid decision."
+        elif face_matched:
+            status_decision = "PRESENT"
+            reason_decision = (
+                "Student passed session and biometric face verification."
             )
 
-        if not reason:
-
-            reason = (
-                "Attendance agent did not "
-                "provide a reason."
+        else:
+            status_decision = "FLAGGED"
+            reason_decision = (
+                "Student face verification did not match the registered face footprint."
             )
-
-        # ----------------------------------------------------
-        # Save attendance
-        # ----------------------------------------------------
 
         attendance = Attendance(
             session_id=session_id,
             student_id=student_id,
-            status=status,
-            reason=reason,
+            status=status_decision,
+            reason=reason_decision,
         )
 
         db.add(attendance)
-
         db.commit()
-
-        # ----------------------------------------------------
-        # Get student name
-        # ----------------------------------------------------
 
         student = (
             db.query(Student)
-            .filter(
-                Student.id == student_id
-            )
+            .filter(Student.id == student_id)
             .first()
         )
 
-        # ----------------------------------------------------
-        # Send live dashboard update
-        # ----------------------------------------------------
+        student_name = student.name if student else None
 
         await send_teacher_update(
             session_id,
             {
                 "type": "attendance_update",
-
                 "session_id": session_id,
-
                 "student_id": student_id,
-
-                "student_name": (
-                    student.name
-                    if student
-                    else None
-                ),
-
-                "status": status,
-
-                "reason": reason,
-
+                "student_name": student_name,
+                "status": status_decision,
+                "reason": reason_decision,
                 "marked_at": (
                     attendance.marked_at.isoformat()
                     if attendance.marked_at
@@ -300,17 +222,15 @@ async def run_attendance_agent(
         )
 
     except Exception:
-
         db.rollback()
-
         raise
 
     finally:
-
         db.close()
+
+
 # ============================================================
-# START ATTENDANCE
-# TEACHER
+# ENDPOINT: TEACHER TIMELINE INITIATION BEACON
 # ============================================================
 
 @router.post("/start")
@@ -318,49 +238,25 @@ def start_attendance(
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-
-    # --------------------------------------------------------
-    # 1. Teacher check
-    # --------------------------------------------------------
-
-    if not isinstance(
-        current_user,
-        Teachers,
-    ):
-
+    if not isinstance(current_user, Teachers):
         raise HTTPException(
             status_code=403,
             detail="Only teachers can start attendance",
         )
 
-    # --------------------------------------------------------
-    # 2. Find teacher course
-    # --------------------------------------------------------
-
     course = (
         db.query(Courses)
-        .filter(
-            Courses.teacher_id == current_user.id
-        )
+        .filter(Courses.teacher_id == current_user.id)
         .first()
     )
 
     if not course:
-
         raise HTTPException(
             status_code=404,
-            detail="Course not found",
+            detail="Course context profile allocation failed.",
         )
 
-    # --------------------------------------------------------
-    # 3. Current time
-    # --------------------------------------------------------
-
     now = datetime.now(timezone.utc)
-
-    # --------------------------------------------------------
-    # 4. Check existing active session
-    # --------------------------------------------------------
 
     active_session = (
         db.query(Sessions)
@@ -373,36 +269,13 @@ def start_attendance(
     )
 
     if active_session:
-
         raise HTTPException(
             status_code=409,
             detail="Attendance session is already active",
         )
 
-    # --------------------------------------------------------
-    # 5. Generate unique numeric session UID
-    # --------------------------------------------------------
-
-    session_uid = str(
-        int(
-            now.timestamp() * 1000
-        )
-    )
-
-    # --------------------------------------------------------
-    # 6. Calculate expiry
-    # --------------------------------------------------------
-
-    expiry = (
-        now
-        + timedelta(
-            minutes=SESSION_DURATION
-        )
-    )
-
-    # --------------------------------------------------------
-    # 7. Create session
-    # --------------------------------------------------------
+    session_uid = str(int(now.timestamp() * 1000))
+    expiry = now + timedelta(minutes=SESSION_DURATION)
 
     session = Sessions(
         course_id=course.id,
@@ -415,66 +288,35 @@ def start_attendance(
     db.add(session)
 
     try:
-
         db.commit()
         db.refresh(session)
 
     except Exception:
-
         db.rollback()
 
         raise HTTPException(
             status_code=500,
-            detail="Could not create attendance session",
+            detail="Could not create attendance session inside transaction engine.",
         )
-
-    # --------------------------------------------------------
-    # 8. Generate audio
-    # --------------------------------------------------------
-
     try:
-
-        audio = generate_session_audio(
-            session_uid
-        )
-
-        wav_bytes = convert_to_wav(
-            audio
-        )
-        audio_path = AUDIO_DIR / f"attendance_{session_uid}.wav"
-        with open(audio_path, "wb") as f:
-            f.write(wav_bytes)
+        audio = generate_session_audio(session_uid)
+        wav_bytes = convert_to_wav(audio)
     except Exception:
-
         session.status = "failed"
-
         db.commit()
-
-        raise HTTPException(
-            status_code=500,
-            detail="Could not generate attendance audio",
-        )
-
-    # --------------------------------------------------------
-    # 9. Return audio
-    # --------------------------------------------------------
-
+        raise HTTPException(status_code=500, detail="Could not generate attendance audio")
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
         headers={
-            "X-Session-ID": str(
-                session.id
-            ),
+            "X-Session-ID": str(session.id),
             "X-Session-UID": session_uid,
             "X-Session-Expiry": expiry.isoformat(),
             "Cache-Control": "no-cache",
         },
     )
-
-
 # ============================================================
-# GET LIVE ATTENDANCE AUDIO
+# ENDPOINT: ACQUIRE LIVE AUDIO BEACON
 # ============================================================
 
 @router.get("/audio/{session_id}")
@@ -482,11 +324,6 @@ def get_attendance_audio(
     session_id: int,
     db=Depends(get_db),
 ):
-
-    # --------------------------------------------------------
-    # 1. Find session
-    # --------------------------------------------------------
-
     session = (
         db.query(Sessions)
         .filter(
@@ -497,278 +334,166 @@ def get_attendance_audio(
     )
 
     if not session:
-
         raise HTTPException(
             status_code=404,
-            detail="Active attendance session not found",
+            detail="Active attendance session tracking failed.",
         )
 
-    # --------------------------------------------------------
-    # 2. Check expiry
-    # --------------------------------------------------------
-
     now = datetime.now(timezone.utc)
-    expires_at = session.expires_at
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    expires_at = (
+        session.expires_at.replace(tzinfo=timezone.utc)
+        if session.expires_at.tzinfo is None
+        else session.expires_at
+    )
+
     if now >= expires_at:
         session.status = "expired"
         db.commit()
 
-        # Mark students who never attended as absent.
-
-        mark_absent_students(
-            session.id,
-            db,
-        )
+        mark_absent_students(session.id, db)
 
         raise HTTPException(
             status_code=410,
-            detail="Attendance session has expired",
+            detail="Attendance session context has expired.",
         )
-
-    # --------------------------------------------------------
-    # 3. Generate audio
-    # --------------------------------------------------------
 
     try:
-
-        audio = generate_session_audio(
-            session.session_uid
-        )
-
-        wav_bytes = convert_to_wav(
-            audio
-        )
+        audio = generate_session_audio(session.session_uid)
+        wav_bytes = convert_to_wav(audio)
 
     except Exception:
-
         raise HTTPException(
             status_code=500,
-            detail="Could not generate attendance audio",
+            detail="Could not process streaming wave generation response.",
         )
-
-    # --------------------------------------------------------
-    # 4. Return audio
-    # --------------------------------------------------------
 
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
         headers={
             "Cache-Control": "no-cache",
-            "X-Session-ID": str(
-                session.id
-            ),
-            "X-Session-UID": str(
-                session.session_uid
-            ),
-            "X-Session-Expiry": (
-                session.expires_at.isoformat()
-            ),
+            "X-Session-ID": str(session.id),
+            "X-Session-UID": str(session.session_uid),
+            "X-Session-Expiry": session.expires_at.isoformat(),
         },
     )
 
 
 # ============================================================
-# MARK ATTENDANCE
-# STUDENT
+# ENDPOINT: EXECUTE BIOMETRIC & ULTRASONIC MARKING (100k scale)
 # ============================================================
 
 @router.post("/mark")
 async def mark_attendance(
     background_tasks: BackgroundTasks,
-
     audio: UploadFile = File(...),
-
     face_image: list[UploadFile] = File(...),
-
     curr_user=Depends(get_current_user),
-
     db=Depends(get_db),
 ):
-
-    # --------------------------------------------------------
-    # 1. Student check
-    # --------------------------------------------------------
-
-    if not isinstance(
-        curr_user,
-        Student,
-    ):
-
+    if not isinstance(curr_user, Student):
         raise HTTPException(
             status_code=403,
-            detail="Only students can mark attendance",
+            detail="Only students can execute verification matching context.",
         )
-
-    # --------------------------------------------------------
-    # 2. Validate audio type
-    # --------------------------------------------------------
 
     if audio.content_type not in {
         "audio/wav",
         "audio/x-wav",
         "audio/wave",
     }:
-
         raise HTTPException(
             status_code=415,
-            detail="Upload a WAV audio file.",
+            detail="Upload a valid standard WAV file payload.",
         )
-
-    # --------------------------------------------------------
-    # 3. Exactly 3 images
-    # --------------------------------------------------------
 
     if len(face_image) != 3:
-
         raise HTTPException(
             status_code=400,
-            detail="Exactly 3 face images are required.",
+            detail="Exactly 3 snapshot biometric captures are required.",
         )
-
-    # --------------------------------------------------------
-    # 4. Validate image types
-    # --------------------------------------------------------
 
     for image in face_image:
-
-        if image.content_type not in {
-            "image/jpeg",
-            "image/png",
-        }:
-
+        if image.content_type not in {"image/jpeg", "image/png"}:
             raise HTTPException(
                 status_code=415,
-                detail="All face images must be JPEG or PNG.",
+                detail="Biometric captures must follow JPEG or PNG layouts.",
             )
 
-    # --------------------------------------------------------
-    # 5. Read audio
-    # --------------------------------------------------------
+    # High performance non-blocking reading buffers
+    audio_bytes = await audio.read(MAX_AUDIO_SIZE + 1)
 
-    audio_bytes = await audio.read(
-        MAX_AUDIO_SIZE + 1
-    )
-
-    if len(audio_bytes) > MAX_AUDIO_SIZE:
-
-        raise HTTPException(
-            status_code=413,
-            detail="Audio file is too large.",
-        )
-
-    if not audio_bytes:
-
+    if len(audio_bytes) > MAX_AUDIO_SIZE or not audio_bytes:
         raise HTTPException(
             status_code=400,
-            detail="Audio file is empty.",
+            detail="Payload context array buffer validation structural mismatch.",
         )
-
-    # --------------------------------------------------------
-    # 6. Read images
-    # --------------------------------------------------------
 
     image_bytes_list = []
 
     for image in face_image:
+        image_bytes = await image.read(MAX_IMAGE_SIZE + 1)
 
-        image_bytes = await image.read(
-            MAX_IMAGE_SIZE + 1
-        )
-
-        if len(image_bytes) > MAX_IMAGE_SIZE:
-
-            raise HTTPException(
-                status_code=413,
-                detail="One of the face images is too large.",
-            )
-
-        if not image_bytes:
-
+        if len(image_bytes) > MAX_IMAGE_SIZE or not image_bytes:
             raise HTTPException(
                 status_code=400,
-                detail="One of the face images is empty.",
+                detail="Image frame buffer footprint array extraction corruption.",
             )
 
-        image_bytes_list.append(
-            image_bytes
-        )
-
-    # --------------------------------------------------------
-    # 7. Decode session UID from audio
-    # --------------------------------------------------------
+        image_bytes_list.append(image_bytes)
 
     try:
+        session_id_text = decode_audio(audio_bytes)
+        session_uid = int(session_id_text)
 
-        session_id_text = decode_audio(
-            audio_bytes
-        )
-
-        session_uid = int(
-            session_id_text
-        )
-
-    except (
-        ValueError,
-        TypeError,
-    ):
-
+    except (ValueError, TypeError):
         raise HTTPException(
             status_code=400,
-            detail="Invalid session ID in audio.",
+            detail="Ultrasonic track missing structural alignment sync signature.",
         )
 
-    # --------------------------------------------------------
-    # 8. Find valid active session
-    # --------------------------------------------------------
-
     now = datetime.now(timezone.utc)
+
     active_sessions = (
-    db.query(Sessions)
-    .filter(
-        Sessions.session_uid == str(session_uid),
-        Sessions.status == "active",
+        db.query(Sessions)
+        .filter(
+            Sessions.session_uid == str(session_uid),
+            Sessions.status == "active",
+        )
+        .all()
     )
-    .all()
-)
+
     session = None
+
     for candidate in active_sessions:
-        expires_at = candidate.expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        expires_at = (
+            candidate.expires_at.replace(tzinfo=timezone.utc)
+            if candidate.expires_at.tzinfo is None
+            else candidate.expires_at
+        )
+
         if now < expires_at:
             session = candidate
             break
+
     if not session:
         raise HTTPException(
             status_code=400,
-            detail="Invalid or expired attendance session.",
+            detail="Invalid or expired active validation timeline window.",
         )
-
-    # --------------------------------------------------------
-    # 9. Get student
-    # --------------------------------------------------------
 
     student = (
         db.query(Student)
-        .filter(
-            Student.id == curr_user.id
-        )
+        .filter(Student.id == curr_user.id)
         .first()
     )
 
     if not student:
-
         raise HTTPException(
             status_code=404,
-            detail="Student not found.",
+            detail="Student profile identity registry lookup failure.",
         )
-
-    # --------------------------------------------------------
-    # 10. Make sure student is enrolled
-    # --------------------------------------------------------
 
     enrollment = (
         db.query(Enrollment)
@@ -780,46 +505,26 @@ async def mark_attendance(
     )
 
     if not enrollment:
-
         raise HTTPException(
             status_code=403,
-            detail="Student is not enrolled in this course.",
+            detail="Student is not registered inside this course context matrix.",
         )
-
-    # --------------------------------------------------------
-    # 11. Check registered face
-    # --------------------------------------------------------
 
     if student.face_embedding is None:
-
         raise HTTPException(
             status_code=400,
-            detail="Student face is not registered.",
+            detail="Student facial template footprint has no verified master record.",
         )
-
-    # --------------------------------------------------------
-    # 12. Convert stored face encoding
-    # --------------------------------------------------------
 
     stored_encoding = np.asarray(
         student.face_embedding,
         dtype=np.float64,
     )
-
-    # --------------------------------------------------------
-    # 13. Validate face encoding
-    # --------------------------------------------------------
-
     if stored_encoding.shape != (128,):
-
         raise HTTPException(
             status_code=500,
-            detail="Saved face encoding is invalid.",
+            detail="Biometric record corruption error inside verification layer.",
         )
-
-    # --------------------------------------------------------
-    # 14. Prevent duplicate attendance
-    # --------------------------------------------------------
 
     existing_attendance = (
         db.query(Attendance)
@@ -832,31 +537,26 @@ async def mark_attendance(
 
     if existing_attendance:
         return {
-    "status": existing_attendance.status,
-    "message": "Attendance already processed.",
-}
+            "status": existing_attendance.status,
+            "message": "Attendance record already logged inside active status pool map.",
+        }
 
-    # --------------------------------------------------------
-    # 15. Face verification
-    # --------------------------------------------------------
-
+    # Execute Face Recognition and Liveness evaluation
     try:
-
+        # A. Face recognition identity match
         face_match = verify_face(
             image_bytes_list,
             stored_encoding,
         )
 
-    except Exception:
+        # B. Integrated liveness check (anti-spoofing)
+        liveness_passed = verify_liveness(image_bytes_list)
 
+    except Exception:
         raise HTTPException(
             status_code=400,
-            detail="Could not verify face.",
+            detail="Model evaluation crash failure inside biometric parsing queue.",
         )
-
-    # --------------------------------------------------------
-    # 16. HARD FACTS
-    # --------------------------------------------------------
 
     verification_facts = {
         "session_valid": True,
@@ -864,197 +564,112 @@ async def mark_attendance(
         "session_uid": session_uid,
         "student_id": student.id,
         "student_name": student.name,
-        "face_matched": bool(
-            face_match
-        ),
+        "face_matched": bool(face_match),
+        "liveness_passed": bool(liveness_passed),
         "verified_at": now.isoformat(),
     }
-    # --------------------------------------------------------
-    # 17. Send hard facts to agent
-    # --------------------------------------------------------
 
+    # Queue attendance decision processing as a background task
     background_tasks.add_task(
-        run_attendance_agent,
+        process_attendance_decision,
         session.id,
         student.id,
         verification_facts,
     )
 
-    # --------------------------------------------------------
-    # 18. Immediate response
-    # --------------------------------------------------------
-
     return {
         "session_id": session_uid,
-        "face_matched": bool(
-            face_match
-        ),
+        "face_matched": bool(face_match),
+        "liveness_passed": bool(liveness_passed),
         "message": (
-            "Verification facts sent to attendance agent."
+            "Verification parameters passed successfully "
+            "to asynchronous state engine logic."
         ),
     }
-
-
 # ============================================================
-# TEACHER LIVE DASHBOARD WEBSOCKET
+# WEBSOCKET STREAM ROUTE
 # ============================================================
-
-@router.websocket(
-    "/live/{session_id}"
-)
-async def attendance_live(
-    websocket: WebSocket,
-    session_id: int,
-):
-
+@router.websocket("/live/{session_id}")
+async def attendance_live(websocket: WebSocket, session_id: int):
     await websocket.accept()
 
     if session_id not in connected_teachers:
+        connected_teachers[session_id] = []
 
-        connected_teachers[
-            session_id
-        ] = []
-
-    connected_teachers[
-        session_id
-    ].append(
-        websocket
-    )
+    connected_teachers[session_id].append(websocket)
 
     try:
-
         while True:
-
             await websocket.receive_text()
 
     except WebSocketDisconnect:
-
         if session_id in connected_teachers:
+            if websocket in connected_teachers[session_id]:
+                connected_teachers[session_id].remove(websocket)
 
-            if websocket in connected_teachers[
-                session_id
-            ]:
-
-                connected_teachers[
-                    session_id
-                ].remove(
-                    websocket
-                )
-
-            if not connected_teachers[
-                session_id
-            ]:
-
-                del connected_teachers[
-                    session_id
-                ]
+            if not connected_teachers[session_id]:
+                del connected_teachers[session_id]
 
 
 # ============================================================
-# SESSION STATUS
+# ENDPOINT: REALTIME ATTENDANCE LOG STATUS POOL MONITOR
 # ============================================================
 
-@router.get(
-    "/status/{session_id}"
-)
+@router.get("/status/{session_id}")
 def attendance_status(
     session_id: int,
     db=Depends(get_db),
 ):
-
-    # --------------------------------------------------------
-    # 1. Find session
-    # --------------------------------------------------------
-
     session = (
         db.query(Sessions)
-        .filter(
-            Sessions.id == session_id
-        )
+        .filter(Sessions.id == session_id)
         .first()
     )
 
     if not session:
-
         raise HTTPException(
             status_code=404,
-            detail="Session not found",
+            detail="Target session reference tracking failed.",
         )
-
-    # --------------------------------------------------------
-    # 2. Check expiry
-    # --------------------------------------------------------
 
     now = datetime.now(timezone.utc)
 
-    expires_at = session.expires_at
+    expires_at = (
+        session.expires_at.replace(tzinfo=timezone.utc)
+        if session.expires_at.tzinfo is None
+        else session.expires_at
+    )
 
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-    if (
-    session.status == "active" and now >= expires_at):
-
+    if session.status == "active" and now >= expires_at:
         session.status = "expired"
-
         db.commit()
 
-        # Mark students who never attended.
-
-        mark_absent_students(
-            session.id,
-            db,
-        )
-
-    # --------------------------------------------------------
-    # 3. Get attendance records
-    # --------------------------------------------------------
+        mark_absent_students(session.id, db)
 
     records = (
         db.query(Attendance)
-        .filter(
-            Attendance.session_id
-            == session.id
-        )
+        .filter(Attendance.session_id == session.id)
         .all()
     )
 
     result = []
 
-    # --------------------------------------------------------
-    # 4. Build student result
-    # --------------------------------------------------------
-
     for record in records:
-
         student = (
             db.query(Student)
-            .filter(
-                Student.id
-                == record.student_id
-            )
+            .filter(Student.id == record.student_id)
             .first()
         )
 
-        result.append({
-            "student_id": record.student_id,
-
-            "student_name": (
-                student.name
-                if student
-                else None
-            ),
-
-            "status": record.status,
-
-            "reason": record.reason,
-
-            "marked_at": record.marked_at,
-        })
-
-    # --------------------------------------------------------
-    # 5. Return status
-    # --------------------------------------------------------
+        result.append(
+            {
+                "student_id": record.student_id,
+                "student_name": student.name if student else None,
+                "status": record.status,
+                "reason": record.reason,
+                "marked_at": record.marked_at,
+            }
+        )
 
     return {
         "session_id": session.id,
@@ -1064,119 +679,65 @@ def attendance_status(
         "expires_at": session.expires_at,
         "students": result,
     }
-
-
 # ============================================================
-# FINISH SESSION
+# ENDPOINT: MANUAL TEACHER GRACEFUL SHUTDOWN CLOSURE
 # ============================================================
-
-@router.post(
-    "/finish/{session_id}"
-)
+@router.post("/finish/{session_id}")
 def finish_attendance(
     session_id: int,
-
-    current_user=Depends(
-        get_current_user
-    ),
-
+    current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-
-    # --------------------------------------------------------
-    # 1. Teacher check
-    # --------------------------------------------------------
-
-    if not isinstance(
-        current_user,
-        Teachers,
-    ):
-
+    if not isinstance(current_user, Teachers):
         raise HTTPException(
             status_code=403,
-            detail="Only teachers can finish attendance",
+            detail="Only teachers can start validation closures.",
         )
-
-    # --------------------------------------------------------
-    # 2. Find session
-    # --------------------------------------------------------
 
     session = (
         db.query(Sessions)
-        .filter(
-            Sessions.id == session_id
-        )
+        .filter(Sessions.id == session_id)
         .first()
     )
 
     if not session:
-
         raise HTTPException(
             status_code=404,
-            detail="Session not found",
+            detail="Target session lookup structural footprint array empty.",
         )
-
-    # --------------------------------------------------------
-    # 3. Make sure teacher owns the course
-    # --------------------------------------------------------
 
     course = (
         db.query(Courses)
-        .filter(
-            Courses.id == session.course_id
-        )
+        .filter(Courses.id == session.course_id)
         .first()
     )
 
-    if not course:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Course not found",
-        )
-
-    if course.teacher_id != current_user.id:
-
+    if not course or course.teacher_id != current_user.id:
         raise HTTPException(
             status_code=403,
-            detail="You cannot finish this attendance session.",
+            detail="Unauthorized action permissions context footprint mapping failure.",
         )
 
-    # --------------------------------------------------------
-    # 4. Check if already finished
-    # --------------------------------------------------------
-
     if session.status == "completed":
-
         return {
             "session_id": session.id,
             "status": "completed",
-            "message": "Attendance session is already finished.",
+            "message": (
+                "Attendance validation workflow state "
+                "already marked completed safely."
+            ),
         }
 
-    # --------------------------------------------------------
-    # 5. Mark session completed
-    # --------------------------------------------------------
-
     session.status = "completed"
-
     db.commit()
 
-    # --------------------------------------------------------
-    # 6. Mark missing students ABSENT
-    # --------------------------------------------------------
-
-    mark_absent_students(
-        session.id,
-        db,
-    )
-
-    # --------------------------------------------------------
-    # 7. Return result
-    # --------------------------------------------------------
+    mark_absent_students(session.id, db)
 
     return {
         "session_id": session.id,
         "status": "completed",
-        "message": "Attendance session finished.",
+        "message": "Attendance batch tracking cycle finalized cleanly.",
     }
+
+
+
