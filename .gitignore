@@ -52,3 +52,5 @@ ENV/
 *.wav
 uploads/
 headers.txt
+
+deploy.env
