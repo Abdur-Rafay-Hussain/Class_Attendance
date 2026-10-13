@@ -5,6 +5,7 @@ export type Role = 'student' | 'teacher'
 export interface TokenResponse {
   access_token: string
   token_type: string
+  name?: string
 }
 
 export interface AuthSession {
@@ -87,7 +88,6 @@ async function send(
   { method = 'GET', body, headers = {}, auth = false, signal, accept = 'application/json' }: RequestOptions = {},
 ): Promise<Response> {
   const finalHeaders: Record<string, string> = { Accept: accept, ...headers }
-
   if (auth) {
     if (!accessToken) throw new ApiError('You are not signed in.', 401)
     finalHeaders.Authorization = `Bearer ${accessToken}`
@@ -115,7 +115,6 @@ async function send(
     }
     throw new ApiError(extractErrorMessage(parsed, response.status), response.status)
   }
-
   return response
 }
 
@@ -159,11 +158,16 @@ function roleFromToken(claims: Record<string, unknown> | null): Role | null {
 
 /**
  * The backend sends datetimes without a timezone (they are UTC). Treat a missing timezone as UTC
- * so that times are not shifted by the browser's local timezone.
+ * so that times are not shifted by the browser's local timezone. HTTP "Date" headers end with
+ * GMT and are parsed directly.
  */
 export function parseServerTime(value: unknown): number | null {
   if (typeof value !== 'string' || !value.trim()) return null
   const text = value.trim().replace(/(\.\d{3})\d+/, '$1')
+  if (/(GMT|UTC)$/i.test(text)) {
+    const direct = Date.parse(text)
+    return Number.isNaN(direct) ? null : direct
+  }
   const hasZone = /(Z|[+-]\d{2}(:?\d{2})?)$/i.test(text)
   const ms = Date.parse(hasZone ? text : `${text}Z`)
   return Number.isNaN(ms) ? null : ms
@@ -204,7 +208,6 @@ export async function login(email: string, password: string): Promise<AuthSessio
     body: form,
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
   })
-
   if (!token?.access_token) throw new ApiError('The server did not return an access token.', 500)
 
   const claims = decodeJwtPayload(token.access_token)
@@ -214,7 +217,12 @@ export async function login(email: string, password: string): Promise<AuthSessio
   }
 
   setAccessToken(token.access_token)
-  const name = typeof claims?.name === 'string' ? claims.name : null
+  const name =
+    typeof token.name === 'string' && token.name
+      ? token.name
+      : typeof claims?.name === 'string'
+        ? claims.name
+        : null
   return {
     accessToken: token.access_token,
     tokenType: token.token_type,
@@ -231,15 +239,17 @@ export interface StudentRegistration {
   email: string
   password: string
   photos: File[]
+  challengeId: string
 }
 
-export async function registerStudent({ studentId, name, email, password, photos }: StudentRegistration) {
+export async function registerStudent({ studentId, name, email, password, photos, challengeId }: StudentRegistration) {
   const form = new FormData()
   // The backend field is spelled exactly "Student_id".
   form.append('Student_id', studentId)
   form.append('name', name)
   form.append('email', email)
   form.append('password', password)
+  form.append('challenge_id', challengeId)
   photos.forEach((photo) => form.append('photos', photo))
   try {
     return await requestJson<{ message?: string }>('/register', { method: 'POST', body: form })
@@ -270,11 +280,9 @@ export async function signupTeacher({ name, email, password, courseName, secretK
       secret_key: secretKey,
     }),
   })
-
   if (typeof raw.course_id !== 'number') {
     throw new ApiError('The server did not return the course ID.', 502)
   }
-
   storeCourseId(email, raw.course_id)
   return { message: raw.message, courseId: raw.course_id }
 }
@@ -310,7 +318,6 @@ async function readSessionAudio(response: Response, receivedAt: number): Promise
   const uidHeader = response.headers.get('X-Session-UID')
   const expiryHeader = parseServerTime(response.headers.get('X-Session-Expiry'))
   const sessionId = Number(idHeader)
-
   if (!idHeader || !Number.isInteger(sessionId) || !uidHeader || expiryHeader === null) {
     throw new ApiError('The server did not return the session details with the audio.', 502)
   }
@@ -321,7 +328,6 @@ async function readSessionAudio(response: Response, receivedAt: number): Promise
 
   const audio = await response.blob()
   if (audio.size === 0) throw new ApiError('The server returned empty audio.', 502)
-
   return {
     sessionId,
     sessionUid: uidHeader,
@@ -403,7 +409,6 @@ export async function getSessionStatus(sessionId: number): Promise<SessionStatus
   const records = (raw.students ?? [])
     .map((s) => toRecord(s.student_id, s.student_name, s.status, s.reason, s.marked_at))
     .filter((r): r is AttendanceRecord => r !== null)
-
   return {
     sessionId: typeof raw.session_id === 'number' ? raw.session_id : sessionId,
     sessionUid: String(raw.session_uid ?? ''),
@@ -424,7 +429,11 @@ export async function finishAttendance(sessionId: number) {
 
 /** WebSocket address of the live attendance feed for a session (the backend does not require auth here). */
 export function attendanceSocketUrl(sessionId: number): string {
-  return `${BACKEND_ORIGIN.replace(/^http/, 'ws')}/attendance/live/${sessionId}`
+  if (process.env.NEXT_PUBLIC_API_BASE_URL) {
+    return `${BACKEND_ORIGIN.replace(/^http/, 'ws')}/attendance/live/${sessionId}`
+  }
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  return `${proto}://${window.location.hostname}:8001/attendance/live/${sessionId}`
 }
 
 /** Converts a message from the live WebSocket into a record. Returns null for anything unexpected. */
@@ -450,6 +459,7 @@ export function parseAttendanceEvent(data: unknown): AttendanceRecord | null {
 export interface MarkResult {
   sessionUid: string
   faceMatched: boolean
+  livenessPassed: boolean
   message: string
   alreadyProcessed: boolean
   status?: string
@@ -459,17 +469,19 @@ export interface MarkResult {
 interface RawMarkResponse {
   session_id?: number | string
   face_matched?: boolean
+  liveness_passed?: boolean
   message?: string
   status?: string
   reason?: string
 }
 
 /** POST /attendance/mark — real WAV recording + exactly 3 face images. */
-export async function markAttendance(audio: Blob, faceImages: Blob[]): Promise<MarkResult> {
+export async function markAttendance(audio: Blob, faceImages: Blob[], challengeId: string): Promise<MarkResult> {
   if (faceImages.length !== 3) throw new ApiError('Exactly 3 face images are required.', 400)
 
   const form = new FormData()
   form.append('audio', new Blob([audio], { type: 'audio/wav' }), 'attendance.wav')
+  form.append('challenge_id', challengeId)
   faceImages.forEach((image, index) => {
     form.append('face_image', new Blob([image], { type: 'image/jpeg' }), `face-${index + 1}.jpg`)
   })
@@ -481,13 +493,29 @@ export async function markAttendance(audio: Blob, faceImages: Blob[]): Promise<M
   if (!alreadyProcessed && typeof raw.face_matched !== 'boolean') {
     throw new ApiError('The server returned an unexpected check-in response.', 502)
   }
-
   return {
     sessionUid: String(raw.session_id ?? ''),
     faceMatched: alreadyProcessed ? raw.status === 'PRESENT' : raw.face_matched === true,
+    livenessPassed: raw.liveness_passed !== false,
     message: raw.message ?? '',
     alreadyProcessed,
     status: raw.status,
     reason: raw.reason,
   }
+}
+// ============================================================
+// LIVENESS CHALLENGE (GET /liveness/challenge)
+// ============================================================
+
+export interface LivenessChallenge {
+  challengeId: string
+  steps: string[]
+}
+
+export async function getLivenessChallenge(): Promise<LivenessChallenge> {
+  const raw = await requestJson<{ challenge_id?: string; steps?: string[] }>('/liveness/challenge')
+  if (!raw.challenge_id || !Array.isArray(raw.steps) || raw.steps.length !== 3) {
+    throw new ApiError('The server did not return a valid liveness challenge.', 502)
+  }
+  return { challengeId: raw.challenge_id, steps: raw.steps }
 }

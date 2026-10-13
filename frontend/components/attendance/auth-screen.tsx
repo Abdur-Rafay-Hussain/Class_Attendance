@@ -272,7 +272,7 @@ function AuthForm({ role, onAuthenticated }: AuthFormProps) {
     }
   }
 
-  async function handleCaptured(images: Blob[]) {
+  async function handleCaptured(images: Blob[], challengeId: string) {
     setStep('saving')
     setError(null)
     let registered = false
@@ -284,6 +284,7 @@ function AuthForm({ role, onAuthenticated }: AuthFormProps) {
         email: email.trim(),
         password,
         photos,
+        challengeId,
       })
       registered = true
       const ok = await signIn(name.trim())

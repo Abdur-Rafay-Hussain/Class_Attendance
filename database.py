@@ -44,7 +44,15 @@ SessionLocal = sessionmaker(
     autoflush=False,
     bind=engine
 )
+from sqlalchemy import event
 
+
+@event.listens_for(engine, "connect")
+def _set_utc_timezone(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("SET TIME ZONE 'UTC'")
+    cursor.close()
+    dbapi_connection.commit()
 
 Base = declarative_base()
 

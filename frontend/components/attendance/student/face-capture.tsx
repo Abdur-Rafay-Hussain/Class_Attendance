@@ -3,18 +3,28 @@
 import { useEffect, useRef, useState } from 'react'
 import { motion } from 'motion/react'
 import { CheckCircle2, Loader2 } from 'lucide-react'
+import { getLivenessChallenge } from '@/lib/api'
 import { FACE_SNAPSHOT_COUNT } from '@/lib/attendance'
 import { cn } from '@/lib/utils'
 
 // Time to let the camera adjust its exposure before the first photo.
-const WARMUP_MS = 1500
-// Time between the automatic photos.
-const INTERVAL_MS = 1000
+const WARMUP_MS = 2000
+// Time the person gets to perform each action before its photo is taken.
+const ACTION_MS = 2800
+// Short pause between two steps.
+const PAUSE_MS = 700
 const MAX_FRAME_WIDTH = 960
 
+const STEP_TEXT: Record<string, string> = {
+  FRONT: 'Look straight at the camera and keep your eyes open.',
+  EYES_CLOSED: 'Close your eyes and keep them closed…',
+  TURN_LEFT: 'Slowly turn your head to the left and hold.',
+  TURN_RIGHT: 'Slowly turn your head to the right and hold.',
+}
+
 interface FaceCaptureProps {
-  /** Called once with exactly 3 live JPEG photos taken from the camera. */
-  onCaptured: (images: Blob[]) => void
+  /** Called once with exactly 3 live JPEG photos and the liveness challenge they belong to. */
+  onCaptured: (images: Blob[], challengeId: string) => void
   onError: (message: string) => void
   onCancel?: () => void
 }
@@ -50,14 +60,15 @@ function describeCameraError(error: unknown): string {
 }
 
 /**
- * Opens the live camera as soon as it appears and automatically takes 3 photos, one after another.
- * There is no capture button and no gallery upload — only real camera frames are produced.
+ * Opens the live camera as soon as it appears, asks the server for a random liveness challenge and then takes
+ * one photo per step (look straight, close eyes, turn head). There is no capture button and no gallery upload.
  */
 export function FaceCapture({ onCaptured, onError, onCancel }: FaceCaptureProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [status, setStatus] = useState<CaptureStatus>('starting')
   const [taken, setTaken] = useState(0)
   const [flash, setFlash] = useState(false)
+  const [instruction, setInstruction] = useState('')
 
   const handlers = useRef({ onCaptured, onError })
   useEffect(() => {
@@ -83,7 +94,6 @@ export function FaceCapture({ onCaptured, onError, onCancel }: FaceCaptureProps)
         handlers.current.onError('Camera is not available. Open this app on http://localhost or over HTTPS.')
         return
       }
-
       try {
         const media = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
@@ -94,7 +104,6 @@ export function FaceCapture({ onCaptured, onError, onCancel }: FaceCaptureProps)
           return
         }
         stream = media
-
         const video = videoRef.current
         if (!video) throw new Error('The camera preview is not ready.')
         video.srcObject = media
@@ -109,25 +118,38 @@ export function FaceCapture({ onCaptured, onError, onCancel }: FaceCaptureProps)
         }
         if (cancelled) return
 
+        // A fresh random challenge from the server for every attempt.
+        const challenge = await getLivenessChallenge()
+        if (cancelled) return
+
         setStatus('capturing')
+        setInstruction('Get ready…')
         await sleep(WARMUP_MS)
 
         const images: Blob[] = []
-        for (let index = 0; index < FACE_SNAPSHOT_COUNT; index++) {
+        for (let index = 0; index < challenge.steps.length; index++) {
           if (cancelled) return
+          setInstruction(STEP_TEXT[challenge.steps[index]] ?? 'Follow the instruction on screen.')
+          await sleep(ACTION_MS)
+          if (cancelled) return
+
           const blob = await captureFrame(video)
           if (!blob) throw new Error('Could not take a photo from the camera. Please try again.')
           images.push(blob)
           setTaken(index + 1)
           setFlash(true)
           timers.push(setTimeout(() => setFlash(false), 150))
-          if (index < FACE_SNAPSHOT_COUNT - 1) await sleep(INTERVAL_MS)
+
+          if (index < challenge.steps.length - 1) {
+            setInstruction('Good. Get ready for the next step…')
+            await sleep(PAUSE_MS)
+          }
         }
         if (cancelled) return
 
         stopCamera()
         setStatus('done')
-        handlers.current.onCaptured(images)
+        handlers.current.onCaptured(images, challenge.challengeId)
       } catch (error) {
         if (cancelled) return
         stopCamera()
@@ -145,13 +167,7 @@ export function FaceCapture({ onCaptured, onError, onCancel }: FaceCaptureProps)
   }, [])
 
   const message =
-    status === 'starting'
-      ? 'Opening camera…'
-      : taken === 0
-        ? 'Look straight at the camera. Photos are taken automatically.'
-        : status === 'done'
-          ? 'All photos captured.'
-          : `Photo ${taken} of ${FACE_SNAPSHOT_COUNT} captured. Stay still…`
+    status === 'starting' ? 'Opening camera…' : status === 'done' ? 'All photos captured.' : instruction
 
   return (
     <div className="flex flex-col gap-4">
@@ -164,19 +180,16 @@ export function FaceCapture({ onCaptured, onError, onCancel }: FaceCaptureProps)
           className="size-full object-cover"
           style={{ transform: 'scaleX(-1)' }}
         />
-
         <div
           aria-hidden="true"
           className="pointer-events-none absolute left-1/2 top-1/2 h-[78%] w-[52%] -translate-x-1/2 -translate-y-1/2 rounded-[50%] border-2 border-primary/70 shadow-[0_0_30px_-4px] shadow-primary/60"
         />
-
         <motion.div
           aria-hidden="true"
           className="pointer-events-none absolute inset-0 bg-white"
           animate={{ opacity: flash ? 0.7 : 0 }}
           transition={{ duration: 0.12 }}
         />
-
         {status === 'starting' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/50 text-sm text-muted-foreground">
             <Loader2 className="size-6 animate-spin text-primary" aria-hidden="true" />

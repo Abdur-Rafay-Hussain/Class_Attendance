@@ -36,8 +36,8 @@ const TARGET_SAMPLE_RATE = 44_100
 // Used only by the "what this phone heard" report. They must match BASE_FREQUENCY, FREQUENCY_STEP and
 // MARKER_FREQUENCY in the backend gen_audio.py.
 const BEACON_BASE_HZ = 4_000
-const BEACON_STEP_HZ = 40
-const BEACON_MARKER_HZ = 4_700
+const BEACON_STEP_HZ = 60
+const BEACON_MARKER_HZ = 4_800
 
 type Phase = 'idle' | 'listening' | 'processing' | 'camera' | 'submitting' | 'success' | 'failure'
 
@@ -399,7 +399,7 @@ function analyzeBeacon(samples: Float32Array): string {
     }
     const frequency = dominantFrequency(samples, s, e)
     const ms = Math.round(((e - s) / rate) * 1000)
-    if (Math.abs(frequency - BEACON_MARKER_HZ) < 100) {
+    if (Math.abs(frequency - BEACON_MARKER_HZ) < 150) {
       if (digits.length) groups.push(digits.join(''))
       digits = []
       markers++
@@ -408,7 +408,7 @@ function analyzeBeacon(samples: Float32Array): string {
     }
     const digit = Math.round((frequency - BEACON_BASE_HZ) / BEACON_STEP_HZ)
     const expected = BEACON_BASE_HZ + digit * BEACON_STEP_HZ
-    if (digit >= 0 && digit <= 9 && Math.abs(frequency - expected) < 25) {
+    if (digit >= 0 && digit <= 9 && Math.abs(frequency - expected) < 45) {
       digits.push(String(digit))
       digitTones++
       heard.push(String(digit))
@@ -546,7 +546,7 @@ export function StudentCheckIn({ userName }: { userName: string }) {
   }
 
   // Step 2 finished: the camera took 3 live photos. Send the audio and the photos together.
-  async function handleFaceCaptured(images: Blob[]) {
+  async function handleFaceCaptured(images: Blob[], challengeId: string) {
     const runId = runRef.current
     const wav = wavRef.current
     if (!wav) {
@@ -557,7 +557,7 @@ export function StudentCheckIn({ userName }: { userName: string }) {
     setPhase('submitting')
 
     try {
-      const response = await markAttendance(wav, images)
+      const response = await markAttendance(wav, images, challengeId)
       if (runRef.current !== runId) return
       setSubmitted(true)
 
@@ -569,6 +569,13 @@ export function StudentCheckIn({ userName }: { userName: string }) {
           message: `Your attendance for this session is already saved as ${saved}.${response.reason ? ` ${response.reason}` : ''}`,
         })
         setPhase(response.status === 'PRESENT' ? 'success' : 'failure')
+      } else if (!response.livenessPassed) {
+        setResult({
+          time: nowLabel(),
+          title: 'Liveness check failed',
+          message: 'The live face check did not pass. Your attempt was flagged for your teacher.',
+        })
+        setPhase('failure')
       } else if (response.faceMatched) {
         setResult({
           time: nowLabel(),
@@ -591,17 +598,7 @@ export function StudentCheckIn({ userName }: { userName: string }) {
       const message =
         error instanceof ApiError ? error.message : 'Something went wrong while contacting the server.'
 
-      // When the server could not read the audio, also show what this phone's recording contained.
-      let details: string | undefined
-      const audioProblem = error instanceof ApiError && error.status === 400 && /audio|session id/i.test(error.message)
-      if (audioProblem && processedRef.current) {
-        try {
-          details = analyzeBeacon(processedRef.current)
-        } catch {
-          details = undefined
-        }
-      }
-      fail('Verification failed', message, details)
+      fail('Verification failed', message)
     }
   }
 

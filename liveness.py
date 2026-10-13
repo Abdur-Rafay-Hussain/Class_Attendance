@@ -9,6 +9,7 @@ import numpy as np
 from dotenv import load_dotenv
 from fastapi import HTTPException
 from jose import JWTError, jwt
+from PIL import Image
 
 load_dotenv()
 
@@ -28,13 +29,18 @@ EYES_CLOSED_MAX = 0.20
 EYES_OPEN_MIN = 0.22
 
 # Head turn: 0.5 means facing the camera. Anything beyond 0.5 +/- TURN_MIN_DEVIATION counts as turned.
-TURN_MIN_DEVIATION = 0.12
+# Upper limit koi nahi hai, is liye zyada ghumana bhi pass hota hai.
+TURN_MIN_DEVIATION = 0.08
 FRONT_MAX_DEVIATION = 0.15
 
-# Closed eyes make face matching less accurate, so that photo is checked with a looser limit.
+# Closed eyes / turned head make face matching less accurate, so those photos use looser limits.
 CLOSED_EYES_EXTRA_DISTANCE = 0.15
+TURNED_EXTRA_DISTANCE = 0.30
 # During registration all photos must show the same person (usual dlib same-person limit).
 SAME_PERSON_DISTANCE = 0.60
+
+# Bari photo ko detection se pehle is size tak chhota kiya jata hai (tez aur stable detection).
+MAX_IMAGE_SIDE = 800
 
 _random = secrets.SystemRandom()
 _used_lock = threading.Lock()
@@ -142,10 +148,34 @@ def _head_turn(marks) -> float:
     return (nose_x - left) / width
 
 
+def _load_image(image_bytes: bytes):
+    """Loads the photo and shrinks it if it is very large."""
+    image = face_recognition.load_image_file(io.BytesIO(image_bytes))
+    height, width = image.shape[:2]
+    biggest = max(height, width)
+    if biggest > MAX_IMAGE_SIDE:
+        scale = MAX_IMAGE_SIDE / biggest
+        resized = Image.fromarray(image).resize((int(width * scale), int(height * scale)))
+        image = np.array(resized)
+    return image
+
+
+def _find_faces(image):
+    """Seedha chehra -> halka/zyada turn (upsample) -> CNN (side-face bhi pehchanta hai)."""
+    for upsample in (1, 2):
+        locations = face_recognition.face_locations(image, number_of_times_to_upsample=upsample)
+        if locations:
+            return locations
+    try:
+        return face_recognition.face_locations(image, number_of_times_to_upsample=1, model="cnn")
+    except Exception:
+        return []
+
+
 def _analyze_photo(image_bytes: bytes, number: int) -> dict:
     try:
-        image = face_recognition.load_image_file(io.BytesIO(image_bytes))
-        locations = face_recognition.face_locations(image)
+        image = _load_image(image_bytes)
+        locations = _find_faces(image)
     except Exception:
         raise HTTPException(status_code=400, detail=f"Could not read photo {number}.")
 
@@ -242,59 +272,58 @@ def check_liveness(challenge_id: str, image_bytes_list: list[bytes]) -> Liveness
 # ------------------------------------------------------------
 # Face identity
 # ------------------------------------------------------------
-def _split_encodings(result: LivenessResult):
-    open_eyes = [
-        frame["encoding"]
-        for step, frame in zip(result.steps, result.frames)
-        if step != "EYES_CLOSED"
-    ]
-    closed_eyes = [
-        frame["encoding"]
-        for step, frame in zip(result.steps, result.frames)
-        if step == "EYES_CLOSED"
-    ]
-    return open_eyes, closed_eyes
-
-
 def match_stored_face(result: LivenessResult, stored_encoding) -> tuple[bool, float]:
     """
-    Compares the student's registered face with the live photos.
-    Returns (matched, distance of the open-eyes photos). The closed-eyes photo only has to be roughly the same face.
+    Pehchan sirf seedhi (FRONT) photo se hoti hai. Ghumi hui aur band-aankhon wali photos
+    sirf itna check karti hain ke chehra wahi insaan ka hai (loose limit).
+    Returns (matched, distance of the FRONT photo).
     """
     known = np.asarray(stored_encoding, dtype=np.float64)
     if known.shape != (128,):
         raise HTTPException(status_code=500, detail="Saved face encoding has an invalid format.")
 
-    open_eyes, closed_eyes = _split_encodings(result)
-    average = np.mean(np.array(open_eyes, dtype=np.float64), axis=0)
-    distance = float(face_recognition.face_distance([known], average)[0])
-    matched = distance <= FACE_MATCH_THRESHOLD
+    front_distance = None
+    matched = True
+    for step, frame in zip(result.steps, result.frames):
+        distance = float(face_recognition.face_distance([known], frame["encoding"])[0])
+        if step == "FRONT":
+            front_distance = distance
+            if distance > FACE_MATCH_THRESHOLD:
+                matched = False
+        elif step == "EYES_CLOSED":
+            if distance > FACE_MATCH_THRESHOLD + CLOSED_EYES_EXTRA_DISTANCE:
+                matched = False
+        else:
+            if distance > FACE_MATCH_THRESHOLD + TURNED_EXTRA_DISTANCE:
+                matched = False
 
-    for encoding in closed_eyes:
-        closed_distance = float(face_recognition.face_distance([known], encoding)[0])
-        if closed_distance > FACE_MATCH_THRESHOLD + CLOSED_EYES_EXTRA_DISTANCE:
-            matched = False
-
-    return bool(matched), distance
+    return bool(matched), float(front_distance if front_distance is not None else 1.0)
 
 
 def registration_embedding(result: LivenessResult) -> list[float]:
     """
-    Builds the face embedding to save at registration from the open-eyes photos,
-    after checking that all photos show the same person.
+    Registration ka face embedding sirf seedhi (FRONT) photo se banta hai.
+    Baqi photos sirf check karti hain ke sab photos mein wahi insaan hai.
     """
-    open_eyes, closed_eyes = _split_encodings(result)
-    average = np.mean(np.array(open_eyes, dtype=np.float64), axis=0)
-
     same_person_error = HTTPException(
         status_code=400,
         detail="The photos do not appear to show the same person. Please try again.",
     )
-    for encoding in open_eyes:
-        if float(np.linalg.norm(encoding - average)) > SAME_PERSON_DISTANCE:
-            raise same_person_error
-    for encoding in closed_eyes:
-        if float(np.linalg.norm(encoding - average)) > SAME_PERSON_DISTANCE + CLOSED_EYES_EXTRA_DISTANCE:
+
+    front = None
+    for step, frame in zip(result.steps, result.frames):
+        if step == "FRONT":
+            front = frame["encoding"]
+    if front is None:
+        raise same_person_error
+
+    for step, frame in zip(result.steps, result.frames):
+        if step == "FRONT":
+            continue
+        limit = SAME_PERSON_DISTANCE + (
+            CLOSED_EYES_EXTRA_DISTANCE if step == "EYES_CLOSED" else TURNED_EXTRA_DISTANCE
+        )
+        if float(np.linalg.norm(frame["encoding"] - front)) > limit:
             raise same_person_error
 
-    return average.tolist()
+    return np.asarray(front, dtype=np.float64).tolist()

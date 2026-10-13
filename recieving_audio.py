@@ -133,13 +133,7 @@ def decode_audio(wav_bytes: bytes) -> str:
         except Exception as e:
             print(f"Database lookup bypass log: {str(e)}")
 
-    # Fallback response manually matching your layout template
-    seq_str = " ".join([f"M" if x == "M" else x for x in smoothed_sequence])
-    groups_str = " | ".join([f"{g} x1" for g in decoded_groups])
-    raise HTTPException(
-        status_code=400,
-        detail=f"Verification failed\nAudio signal was unclear. Please try again.\n\nWhat this phone heard\n\nSequence: {seq_str}\nGroups: {groups_str if groups_str else 'None'}"
-    )
+    raise HTTPException(status_code=400, detail="Audio signal was unclear.Please try again.")
 
 # =============================================================================
 

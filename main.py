@@ -15,6 +15,7 @@ from attendance import router as attendance_router
 from auth import get_current_user
 from create_teacher import MakeTeacher
 from model import TeacherSignupRequest
+from liveness import create_challenge, check_liveness, registration_embedding
 
 load_dotenv()
 
@@ -92,35 +93,38 @@ async def register(
     name: str = Form(...),
     email: str = Form(...),
     password: str = Form(...),
+    challenge_id: str = Form(...),
     photos: list[UploadFile] = File(...),
     db=Depends(get_db)
 ):
-    # 1. Active Profile Email Duplication Check
+    # 1. Email duplicate check
     if db.query(Student).filter(Student.email == email).first():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email identifier has already been registered inside our grid maps."
         )
-        
-    # 2. Sequential Validation Limits on biometric arrays
-    if not 1 <= len(photos) <= 3:
+
+    # 2. Exactly 3 liveness photos required
+    if len(photos) != 3:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid image payload signature count. Submit between 1 and 3 frames."
+            detail="Exactly 3 face photos are required."
         )
 
-    # Fast stream read pipeline allocation
     images = [await photo.read() for photo in photos]
-    embedding = avg_embedding(images)
 
-    # 3. Vector Match Signature Anti-Spoof check
+    # 3. Liveness challenge (eyes closed / head turn) + same-person check
+    liveness_result = check_liveness(challenge_id, images)
+    embedding = registration_embedding(liveness_result)
+
+    # 4. Duplicate face check
     if is_duplicate_student(embedding, db):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Duplicate biometric identity detected inside master records pool map."
         )
 
-    # 4. Atomic Write Commit Transaction to database grid
+    # 5. Save
     new_student = Student(
         id=Student_id,
         name=name,
@@ -137,7 +141,6 @@ async def register(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Transaction storage mapping execution failure during account write state."
         )
-
     return {"message": "Data Entered Successfully"}
 
 # ============================================================
@@ -249,3 +252,12 @@ def teacher_signup(data: TeacherSignupRequest):
     return MakeTeacher(teacher=data.teacher, course=data.course, secret_key=data.secret_key)
 
 app.include_router(Teacher_router)
+
+# ============================================================
+# ROUTE PATH: LIVENESS CHECK
+# ============================================================
+liveness_router = APIRouter(prefix="/liveness", tags=["Liveness"])
+@liveness_router.get("/challenge")
+async def liveness_challenge():
+    return  create_challenge()
+app.include_router(liveness_router)

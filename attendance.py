@@ -3,6 +3,7 @@ from fastapi import (
     Depends,
     HTTPException,
     File,
+    Form,
     UploadFile,
     Response,
     BackgroundTasks,
@@ -38,12 +39,7 @@ from recieving_audio import (
 )
 
 # === LIVENESS LAYER IMPORT ===
-try:
-    from liveness import verify_liveness
-except ImportError:
-    # Fallback placeholder function if model setup structure differs slightly
-    def verify_liveness(images):
-        return True
+from liveness import check_liveness,match_stored_face
 
 
 import numpy as np
@@ -389,6 +385,7 @@ async def mark_attendance(
     background_tasks: BackgroundTasks,
     audio: UploadFile = File(...),
     face_image: list[UploadFile] = File(...),
+    challenge_id: str = Form(...),
     curr_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
@@ -541,23 +538,18 @@ async def mark_attendance(
             "message": "Attendance record already logged inside active status pool map.",
         }
 
-    # Execute Face Recognition and Liveness evaluation
+    # Liveness challenge check + face identity match
     try:
-        # A. Face recognition identity match
-        face_match = verify_face(
-            image_bytes_list,
-            stored_encoding,
-        )
-
-        # B. Integrated liveness check (anti-spoofing)
-        liveness_passed = verify_liveness(image_bytes_list)
-
+        live_result = check_liveness(challenge_id, image_bytes_list)
+        face_match, _distance = match_stored_face(live_result, stored_encoding)
+        liveness_passed = True
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(
             status_code=400,
             detail="Model evaluation crash failure inside biometric parsing queue.",
         )
-
     verification_facts = {
         "session_valid": True,
         "session_id": session.id,
