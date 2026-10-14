@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    text,
 )
 
 from sqlalchemy.orm import (
@@ -367,5 +368,6 @@ def get_db():
 # ============================================================
 # CREATE TABLES
 # ============================================================
-
+with engine.begin() as conn:
+    conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
 Base.metadata.create_all(engine)
